@@ -14,11 +14,6 @@ IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 or implied.
 """
 
-import sys
-
-import click
-
-
 __author__ = "Mazen Lawand"
 __email__ = "malawand@cisco.com"
 __version__ = "0.1.0"
@@ -34,474 +29,476 @@ __license__ = "Cisco Sample Code License, Version 1.1"
 #   1. Put the script on the affected host via FTP/SCP
 #   2. Run the command, 'py esxi-restore.py'
 #   3. Input all of the IP addresses that is requested for that host
-
+################################################################################################
+#   This script is used to clean up an existing HyperFlex node running ESXi.                   #
+#   This script is NOT used to cleanup the cluster itself, but just the node in the cluster    #
+#   If you need to clean the cluster, run the destroy cluster command on                       #
+#   the CMIP and run this script on every ESXi host to properly clean it up                    #
+#                                                                                              #
+#   Put this script on a non-HX datastore directory under /vmfs/volumes                        #
+#   Example: /vmfs/volumes/23e5b079-c8e4b237-766d-0a8c460c9dac/                                #
+#   /vmfs/volumes/23e5b079-c8e4b237-766d-0a8c460c9dac/hx-clean.py                              #
+#   cd /vmfs/volumes/23e5b079-c8e4b237-766d-0a8c460c9dac/                                      #
+#   Run the python script: python hx-clean.py                                                  #
+#                                                                                              #
+#   If there are errors, read the errors and delete what this script is attempting to delete   #
+#   and run the script again as many times as needed until the node is completely cleaned      #
+################################################################################################
 
 import os
-import sys                                                                                                            
+import sys
 import subprocess
-import re            
-import getpass  
+import re
+import getpass
 import string
-
-network_info = {}
-vSwitches = ['vswitch-hx-storage-data', 'vswitch-hx-vm-network']
-get_vlans_for_networks = ['Storage Controller Management Network', 'Storage Hypervisor Data Network', 'Storage Controller Data Network']
-get_vmk_ip = ['Management Network (vmk0)', 'Storage Hypervisor Data Network (vmk1)']
-vmk_port_mapping = {
-    'Management Network':'vmk0',
-    'Storage Hypervisor Data Network':'vmk1'
-    }
-vSwitch_to_vnic = vSwitches[:]
-vmnic_mapping = {}
-configured_vmnics = []
-portgroup_mapping = {
-"Storage Controller Management Network" : "vswitch-hx-inband-mgmt", 
-"Storage Controller Replication Network" : "vswitch-hx-inband-mgmt", 
-"Storage Hypervisor Data Network" : "vswitch-hx-storage-data",
-"Storage Controller Data Network" : "vswitch-hx-storage-data"
-}
-vlan_mapping = {}
-
+import time
+from itertools import islice
+import json
+from pprint import pprint
 
 
 def getPythonVersion():
-    print("Checking version of Python")
-    if sys.version_info[0] == 3:
-        python_version = 3
-        return 3
-    elif sys.version_info[0] == 2:
-        python_version = 2
-        return 2
-    else:
-        print("Unable to determine Python version.")
-        print("This script supports Python 2 and 3.")
-        sys.exit("Please make sure python is installed on this ESX host. Run the command 'python -V'.")
-python_version = getPythonVersion()        
-def get_network_info():
-    ############################################## DVS Configuration #############################################
-    
-    ########## Checking for DVS ###########
-    print("Are there a DVS's being used for vmotion? (Input 1 for yes and 0 for no)")
-    contains_dvs = input()
-    if contains_dvs == '1':
-        print('This script will not configure for DVS.')
-        print('By default, the Management Network port group is created under vswitch-hx-inband-mgmt (unless using vSwitch0).')
-        print('This script will not configure DVS settings for Management network. Nor will it remove the Management Network.')
-        print('Proceeding.. We will not configure the standard switch for VMotion')
-        contains_dvs = True
-    else:
-        contains_dvs = False
+    # print("Checking version info....")
+    print(sys.version_info[0])
 
-    if contains_dvs is True:
-        # Proceed with the current vSwitches, get_vlans_for_networks, and get_vmk_ip
-        print('\n')
-    else:
-        vmotion_vswitch_name = 'vmotion'
-        vSwitches.append('vmotion')
-        get_vlans_for_networks.append('vmotion')
-        get_vmk_ip.append('vmotion (vmk2)')
-        set_vmk_port_mapping('vmotion','vmk2')
-        setPortGroupMapping('vmotion', 'vmotion')
-        set_vmnic_mapping('vmnic6', vmotion_vswitch_name)
-        set_vmnic_mapping('vmnic7', vmotion_vswitch_name)
-                
-	############################################## End DVS Configuration #############################################
-	
-    ############################################# ISCSI Configuration #############################################
-    print('Do you have ISCSI configured in the network? (Input 1 for yes and 0 for no)')
-    contains_iscsi = input()
-    if contains_iscsi == '1':
-        # Add ISCSI vswitch to the list of switches to be configured.
-        vSwitches.append('vswitch-hx-iscsi')
-        # How many network paths?
-        # Some companies have two networks configured for each network path. 
-        # If they have two network paths, 
-            # vmk3 will be used for the first network path 
-            # vmk4 will be used for the second network path
-        # If they have one network path
-            # vmk3 will be used for ISCSI 
-        print("How many network paths? (Input 1 or 2 for options below)")
-        print('1. One network path \n2. Two network paths')
-        iscsi_paths = input()
-        if iscsi_paths == '1':
-            # Add vmk3 for iscsi
-            print('ISCSI will be configured on vmk3 (iscsi)')
-            get_vlans_for_networks.append('iscsi')
-            get_vmk_ip.append('iscsi (vmk3)')
-            set_vmk_port_mapping('iscsi', 'vmk3')
-            setPortGroupMapping('iscsi', 'vswitch-hx-iscsi')
-        elif iscsi_paths == '2':
-            print('ISCSI will be configured on vmk3 (iscsi-a for path 1) and vmk4 (iscsi-b for path 2)')
-            get_vlans_for_networks.append('iscsi-a')
-            get_vlans_for_networks.append('iscsi-b')
-            get_vmk_ip.append('iscsi-a (vmk3)')
-            set_vmk_port_mapping('iscsi-a', 'vmk3')
-            get_vmk_ip.append('iscsi-b (vmk4)')
-            set_vmk_port_mapping('iscsi-b', 'vmk4')
-            setPortGroupMapping('iscsi-a', 'vswitch-hx-iscsi')
-            setPortGroupMapping('iscsi-b', 'vswitch-hx-iscsi')
-
-    ######################################### End ISCSI Configuration #############################################
-    ######################################### VLANs to be Configured #############################################
-    print('\n\n')
-    print('VLANs to be configured:')
-    for i in get_vlans_for_networks:
-        print('     ' + i)
-    print ('\n')
-    print("VMK's to be configured:")
-    for vmk in get_vmk_ip:
-        print('     ' + vmk)
-        network_info[str(vmk)] = {''}
-
-    print('\n')
-    print('VSwitches to be configured:')
-    for i in vSwitches:
-        print('     ' + i)
-    
-    print('\n')
-    for network in get_vlans_for_networks:        
-        if python_version == 2:
-            network_info[network] = raw_input("What is the VLAN # for "+network+"?\n")
-            while not validateInts(network_info[network]):
-                print('     The VLAN you input is invalid. Please input a valid VLAN')
-                network_info[network] = raw_input("What is the VLAN # for "+network+"?\n")
-        elif python_version == 3:
-            print("What is the VLAN # for "+network+"?")
-            network_info[network] = input()
-            while not validateInts(network_info[network]):
-                print('     The VLAN you input is invalid. Please input a valid VLAN')
-                network_info[network] = input()
-        setVlanMapping(network, network_info[network])
-        
-    for vmk in get_vmk_ip:
-        if(python_version == 2):
-            print("VMK: " + vmk)
-            vmk_network_info1 = raw_input("What is the IP address for " + vmk + "? ")            
-            while not validateIP(vmk_network_info1):
-                print(vmk_network_info1 + " is a invalid IP address. Please try again.")
-                vmk_network_info1 = raw_input("What is the IP address for " + vmk + "? ")
-            network_info[vmk] = str(vmk_network_info1)
-
-
-            netmask = raw_input("What is the netmask?")
-            while not validateIP(netmask):
-                print(netmask + " is a invalid IP address. Please try again")
-                netmask = raw_input("What is the netmask? ")
-            network_info[(vmk+' - Netmask')] = netmask
-
-            gw = raw_input("What is the gateway? Input 0.0.0.0 if no G/W")
-            while not validateIP(gw):
-                print(gw + ' is not a valid IP address. Please try again')
-                gw = raw_input("What is the gateway? ")
-            network_info[(vmk+' - Gateway')] = gw
-            # network_info[(vmk+' - Gateway')] = str(network_info[(vmk+' - Gateway')])
-        elif(python_version == 3):
-            print("What is the IP address for " + vmk + "?")
-            ip = input()
-            while not validateIP(ip):
-                print(ip + ' is an invalid IP. Please try again.')
-                ip = input()
-            network_info[vmk] = ip
-            
-            print("What is the netmask?")
-            nm = input()
-            while not validateIP(nm):
-                print(nm + ' is an invalid IP. Please try again')
-                nm = input()
-            network_info[(vmk+' - Netmask')] = nm
-            
-            print("What is the gateway? Input 0.0.0.0 if no G/W")
-            gw = input()
-            while not validateIP(gw):
-                print(gw + ' is an invalid IP. Please try again.')
-                gw = input()
-            network_info[(vmk+' - Gateway')] = gw
-        
-    ##########################
-    #  Print Network Config  #
-    ##########################
-
-    print('------- Configuration -------')
-    print('\n')
-    print('VLANS: ')    
-    for i in get_vlans_for_networks:
-        print('     ' + str(i) + ': ' + str(network_info[i]))
-        # print('     ', i, ': ', network_info[i])
-    print(' ')    
-    print("VMK's: ")
-    if python_version == 2:
-        print("In python == 2")
-        for vmk in get_vmk_ip:
-            print("VMK: " + vmk)
-            print('')
-            vmk = str(vmk)            
-            vmk_value = network_info[vmk]
-            vmk_value = str(vmk_value)
-            print("     " + vmk + ": " + vmk_value)
-
-            vmk_netmask = vmk + " - Netmask"
-            vmk_netmask = str(vmk_netmask)
-            vmk_value_netmask = network_info[vmk_netmask]
-            vmk_value_netmask = str(vmk_value_netmask)
-            print("     " + vmk + ": " + vmk_value_netmask)
-
-            vmk_gateway = vmk + " - Gateway"
-            vmk_gateway = str(vmk_gateway)
-            vmk_value_gateway = network_info[vmk_gateway]
-            vmk_value_gateway = str(vmk_value_gateway)
-            print("     " + vmk + ": " + vmk_value_gateway)
-
-    
-    elif python_version == 3:
-        for vmk in get_vmk_ip:
-            print('     ', vmk, ': ', network_info[vmk])
-            print('     ', vmk, ': ', network_info[vmk + ' - Netmask'])
-            print('     ', vmk, ': ', network_info[vmk + ' - Gateway'])
-            print(' ')               
-
-    
-    print(' ')
-    print('vSwitches: ')
-    if python_version == 2:
-        for vswitch in vSwitches:
-            print("     " + vswitch)
-    elif python_version == 3:
-        for vswitch in vSwitches:
-            print('     ', vswitch)
-    print('\n')
-    print('----- End Configuration -----')
-
-def validateIP(ip):
-    return bool(re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$",ip))
-
-def validateInts(input):
-    return bool(re.match('^[0-9]+$', input))
-
-def get_inband_mgmt_vswitch():
-	# Confirm that vswitch-hx-inband-mgmt is available
-	print("checking for vswitch-hx-inband-mgmt switch")
-	cmd = "esxcli network vswitch standard list | grep -i 'vswitch-hx-inband-mgmt'"
-	output = os.popen(cmd).readlines()
-	if("Name: vswitch-hx-inband-mgmt" in str(output)):
-		print("vswitch-hx-inband-mgmt exists.. Proceeding")
-		return 'vswitch-hx-inband-mgmt'
-	else:
-		print('vswitch-hx-inband-mgmt does not exist.. Checking for vmk0')
-		cmd = "esxcli network ip interface list | grep -i vmk0 -A 4"
-		output = os.popen(cmd).readlines()
-		for line in output:
-			if re.match("(.*)(P|p)ortset:(.*)", line):
-				r1 = re.findall(r"(?<=:\s)[\w-]+", line)
-				mgmt_vswitch = r1[0]
-				print(mgmt_vswitch) 
-				# Check if vSwitch0
-				if mgmt_vswitch != 'vswitch-hx-inband-mgmt':
-					print("The switch attached to vmk0 is not named vswitch-hx-inband-mgmt. We highly recommend renaming " + mgmt_vswitch + " to vswitch-hx-inband-mgmt. TAC recommends you stop here and rename the vswitch, then re-run this script.\n Would you like to proceed anyways by adding the necessary port groups to " + mgmt_vswitch + "? (Select from the options below). ")
-					print('\n 1. Yes\n 2. No, I would like to rename ' +mgmt_vswitch+ ' to vswitch-hx-inband-mgmt')
-					option = input()
-					if option == '1':
-                        			editInbandMgmtPortGroupMapping(mgmt_vswitch)
-                        			set_vmnic_mapping('vmnic1', mgmt_vswitch)
-                        			return mgmt_vswitch
-					elif option == '2':
-						sys.exit("VMK0 is on "+mgmt_vswitch+". We need to rename "+mgmt_vswitch+" to vswitch-hx-inband-mgmt. \nPlease delete "+mgmt_vswitch+" and rename it to vswitch-hx-inband-mgmt and run this script again.")
-			else:
-				set_vmnic_mapping('vmnic1','vswitch-hx-inband-mgmt')
-				return 'vswitch-hx-inband-mgmt'
-def createvSwitches():
-	# Adding the basic vSwitches	
-	for vSwitch in vSwitches:
-		print('Adding vSwitch: ' + vSwitch)
-		cmd = "esxcli network vswitch standard add -v " + vSwitch
-		output = os.popen(cmd).readlines()
-		if "A portset with this name already exists" in str(output):
-			print('vSwitch ' + vSwitch + " already exists.. Moving on to the next switch")
-		if str(output) == "[]":
-			print(vSwitch + " added")
-
-def enableJumboFrames():
-    for vswitch in vSwitches:
-        print('Enabling Jumbo frames for vswitch: ' + vswitch)
-        os.system('esxcli network vswitch standard set -m 9000 -v ' + vswitch)
-
-def set_vmnic_mapping(vmnic, vswitch):
-    vmnic_mapping[vmnic] = vswitch
-    configured_vmnics.append(vmnic)
-
-def get_vmnic_mapping():
-    return vmnic_mapping
-
-def get_vmnic_mapping_by_key(vmnic):
-    return vmnic_mapping.get(vmnic)
-
-def addVmnics(inband_mgmt_vswitch):
-    
-    vSwitch_to_vnic.insert(0, inband_mgmt_vswitch)
-    
-    vmnic = 1
-    vswitch_index = 0
-
-    for vswitch in vSwitch_to_vnic:
-        print('vswitch: ' + vswitch)
-        if vswitch_index == 0:
-            command = 'esxcli network vswitch standard uplink add -u vmnic' + str(vmnic) + ' -v ' + str(vSwitch_to_vnic[vswitch_index])
-            set_vmnic_mapping('vmnic' + str(vmnic), vSwitch_to_vnic[vswitch_index])
-            vswitch_index += 1
-            # vmnic +=1
-            os.system(command)
-        elif vswitch_index != 0 and vmnic != 0: 
-            print('vswitch: ' + vswitch)
-            vmnic += 1
-            print('Setting vmnic' + str(vmnic) + ' to ' + vSwitch_to_vnic[vswitch_index])
-            command = 'esxcli network vswitch standard uplink add -u vmnic' + str(vmnic) + ' -v ' + str(vSwitch_to_vnic[vswitch_index])
-            set_vmnic_mapping('vmnic' + str(vmnic), vSwitch_to_vnic[vswitch_index])            
-            os.system(command)
-
-            print('Setting vmnic' + str(vmnic) + ' to ' + vSwitch_to_vnic[vswitch_index])
-            vmnic += 1
-            command = 'esxcli network vswitch standard uplink add -u vmnic' + str(vmnic) + ' -v ' + str(vSwitch_to_vnic[vswitch_index])
-            set_vmnic_mapping('vmnic' + str(vmnic), vSwitch_to_vnic[vswitch_index])            
-            os.system(command)
-
-            vswitch_index += 1
-            
-
-def vmnicsToActiveStandby():
-
-    print(get_vmnic_mapping())
-
-    print(configured_vmnics)
-    configured_vmnics.insert(0,'vmnic0')
-    counter = 0
-    previous_vmnic = ''
-    command = ''
-    for vmnic in configured_vmnics:
-        if counter <= len(configured_vmnics):
-            if counter % 2 == 1:
-                if(counter == 1):
-                    vmnic_mapping = 'vswitch-hx-inband-mgmt'
-                    print("esxcli network vswitch standard policy failover set -a vmnic" + str(counter-1) + ' -s vmnic' + str(counter) + ' -v ' + vmnic_mapping)
-                    command = "esxcli network vswitch standard policy failover set -a vmnic" + str(counter-1) + ' -s vmnic' + str(counter) + ' -v ' + vmnic_mapping
-                    # print("esxcli network vswitch standard policy failover set -a " + previous_vmnic + ' -s ' + vmnic + ' -v ' + vmnic_mapping)
-                    # command = "esxcli network vswitch standard policy failover set -a " + str(previous_vmnic) + ' -s ' + str(vmnic) + ' -v ' + vmnic_mapping
-                elif(counter == 5):
-                    vmnic_mapping = 'vswitch-hx-vm-network'
-                    print('esxcli network vswitch standard policy failover set -a vmnic' + str(counter-1) + ',vmnic' + str(counter) + ' -v ' + vmnic_mapping)
-                    command = 'esxcli network vswitch standard policy failover set -a vmnic' + str(counter-1) + ',vmnic' + str(counter) + ' -v ' + vmnic_mapping
-                    # print('esxcli network vswitch standard policy failover set -a ' + previous_vmnic + ',' + vmnic + ' -v ' + vmnic_mapping)
-                    # command = 'esxcli network vswitch standard policy failover set -a ' + str(previous_vmnic) + ',' + str(vmnic) + ' -v ' + vmnic_mapping
-                elif(counter == 7):
-                    vmnic_mapping = 'vmotion'
-                    print("esxcli network vswitch standard policy failover set -a vmnic" + str(counter-1) + ' -s vmnic' + str(counter) + ' -v ' + vmnic_mapping)
-                    command = "esxcli network vswitch standard policy failover set -a vmnic" + str(counter-1) + ' -s vmnic' + str(counter) + ' -v ' + vmnic_mapping
-                    # print("esxcli network vswitch standard policy failover set -a " + previous_vmnic + ' -s ' + vmnic + ' -v ' + get_vmnic_mapping_by_key(vmnic))
-                    # command = "esxcli network vswitch standard policy failover set -a " + str(previous_vmnic) + ' -s ' + str(vmnic) + ' -v ' + get_vmnic_mapping_by_key(vmnic)
-                elif(counter == 3):
-                    vmnic_mapping = 'vswitch-hx-storage-data'
-                    print("esxcli network vswitch standard policy failover set -s vmnic" + str(counter-1) + ' -a vmnic' + str(counter) + ' -v ' + vmnic_mapping)
-                    command = "esxcli network vswitch standard policy failover set -a vmnic" + str(counter-1) + ' -s vmnic' + str(counter) + ' -v ' + vmnic_mapping
-                os.system(command)
-                counter +=1
-            else:
-                previous_vmnic = str(vmnic)
-                counter += 1
-        else:
-            print("counter is bigger than the size of configured vmnic")
-
-
-def createPortGroups():
-    port_groups = getPortGroupMapping()
-
-    for value in port_groups:
-        print("Creating " + value + " port group on " + port_groups[value])
-        command = 'esxcli network vswitch standard portgroup add -p "' + value + '" -v ' + port_groups[value]
-        os.system(command)
-
-
-
-def setVLANS():
-    vlans = getVlanMapping()
-
-    for portgroup in vlans:
-        print('Setting portgroup ' + str(portgroup) + ' to VLAN ' + str(vlans[portgroup]))
-        # print('esxcli network vswitch standard portgroup set -p "' + portgroup + '" -v '+ vlans[portgroup] )
-        command = 'esxcli network vswitch standard portgroup set -p "' + str(portgroup) + '" -v '+ str(vlans[portgroup])
-        os.system(command)
-
-def createVMKernelPorts():
-    vmkports = get_vmk_port_mapping()
-
-    for vmkPortName in vmkports:
-        if vmkPortName == 'Management Network':
-            print("Skipping configuration of vmk0.. not needed.")
-        else:
-            command = 'esxcli network ip interface add -i ' + str(vmkports[vmkPortName]) + ' -p ' + '"' + str(vmkPortName) + '" -m 9000'
-            print(command)
-            os.system(command)
-            output = os.popen(command).readlines()                  
-        # os.system('esxcli network ip interface add -i ' + vmkports[vmkPortName] + ' -p ' + '"' + vmkPortName + '" -m 9000')
-        # print('esxcli network ip interface add -i ' + vmkports[vmkPortName] + ' -p ' + '"' + vmkPortName + '" -m 9000')
-
-
-def assignIpToVmkernel():
-    counter = 0
-    print("In assign vmkernel to ip")
-
-    if python_version == 2:
-        for vmk in get_vmk_ip:
-            command = 'esxcli network ip interface ipv4 set -i vmk' + str(counter) + ' -I ' + network_info[vmk] + ' -N ' + network_info[vmk + ' - Netmask'] + ' -t static '
-            print(command + '\n')
-            os.system(command)
-            counter+=1
-    elif python_version == 3:
-        for vmk in get_vmk_ip:
-            command = 'esxcli network ip interface ipv4 set -i vmk' + str(counter) + ' -I ' + network_info[vmk] + ' -N ' + network_info[vmk + ' - Netmask'] + ' -g ' + network_info[vmk + ' - Gateway'] + ' -t static '
-            print(command)
-            os.system(command)
-            # print('esxcli network ip interface ipv4 set -i vmk' + str(counter) + ' -I ' + network_info[vmk] + ' -N ' + network_info[vmk + ' - Netmask'] + ' -g ' + network_info[vmk + ' - Gateway'] + ' -t static ')
-            counter+=1
-
-def editInbandMgmtPortGroupMapping(inband_mgmt_vswitch):
-    portgroup_mapping["Storage Controller Management Network"] = inband_mgmt_vswitch
-    portgroup_mapping["Storage Controller Replication Network"] = inband_mgmt_vswitch
-
-def setPortGroupMapping(key, value):
-    portgroup_mapping[key] = value
-
-def getPortGroupMapping():
-    return portgroup_mapping
-
-def setVlanMapping(network, vlan):
-    vlan_mapping[network] = vlan
-
-def getVlanMapping():
-    return vlan_mapping
-
-def set_vmk_port_mapping(vmk_port_name, vmk):
-    vmk_port_mapping[vmk_port_name] = vmk
-
-def get_vmk_port_mapping():
-    return vmk_port_mapping
-    
-def main():	
-	####################################
-	#	   Gathering Network Data	   #
-	####################################
+def relinquishSCVM():
     if(getPythonVersion() == 2):
-        print("Executing python2 functions")
+        # Python 2 function
+        print("Python 2 command")
     elif(getPythonVersion() == 3):
-        print("Executing python3 functions")
-    inband_mgmt_vswitch = get_inband_mgmt_vswitch()
-#    set_vmnic_mapping('vmnic1', inband_mgmt_vswitch)
-    get_network_info()
-    createvSwitches()
-    addVmnics(inband_mgmt_vswitch)    
-    createPortGroups()
-    setVLANS()
-    createVMKernelPorts()
-    assignIpToVmkernel()
-    vmnicsToActiveStandby()
-    enableJumboFrames()
+        # Python 3 function
+        print("Python 3 command")
+
+def sshIntoSCVM():    
+    # Getting IP address of the Storage Controller VM
+    # command = '/opt/springpath/support/getstctlvmip.sh "Storage Controller Management Network"'
+    # output = executeFunctionWithReadlines(command)
+    # output = os.popen('/opt/springpath/support/getstctlvmip.sh "Storage Controller Management Network"').readlines()
+    # output = re.finditer(r'[0-9.]',str(output), re.MULTILINE)
+    # ip = ''
+    # for matchNum, match in enumerate(output):        
+    #     ip += match.group()
+    
+    # Check for VM's other than the storage controller VM on the node.
+    # executeFunction(command)
+
+    command = "vim-cmd vmsvc/getallvms | sed -n '1!p' | wc -l"
+    numberOfLines = int(executeFunctionWithRead(command))
+
+    command = "vim-cmd vmsvc/getallvms | sed -n '1!p'"
+    vm_list = executeFunctionWithRead(command)
+    # Validating only 1 vm exists on the host, the SCVM
+    if numberOfLines == 1:
+        vm_list = vm_list.split(" ")
+        vm_id = vm_list[0]
+        vm_name = vm_list[6]        
+        # Check to see if the VM is powered off    
+        command = 'vim-cmd vmsvc/power.get ' + vm_id + " | sed -n '1!p'"
+        power_state = executeFunctionWithRead(command)        
+        power_state = str(power_state.split(" ")[1].strip())
+        
+        
+        if power_state == "on":
+            print("Has the SCVM been relinquished? Input 1 for yes and 0 for no")
+            scvm_relinquished = input()
+            if scvm_relinquished == "1":            
+                powerOffSCVM(vm_id)
+            elif scvm_relinquished == "0":
+                print("Please relinquish the SCVM from the cluster before proceeding.")
+                print("SSH into the storage controller VM as root. ssh root@" + ip)
+                print("Issue the command: python /usr/share/springpath/storfs-misc/relinquish_node.py ")
+        elif power_state == "off":
+            print("SCVM is powered off")
+            destroySCVM(vm_id)
+    elif(numberOfLines == 0):
+        print("There are no SCVM's.. Proceeding to deleting networking")
+        deletePortGroups()
+    else:
+        print("Please migrate all of the VM's off of the node before continuing. Do not migrate the SCVM")
+        
+    
+def powerOffSCVM(vm_id):
+    vm_id = vm_id
+    print("powering off SCVM ...")
+    command = 'vim-cmd vmsvc/power.off ' + str(vm_id)
+    result = executeFunctionWithRead(command)    
+    
+    command = "vim-cmd vmsvc/power.get " + str(vm_id) + " | sed -n '1!p'"
+    result = str(executeFunctionWithRead(command)).split(" ")[1].strip()
+    if result == "off":
+        print("SCVM is off")
+        destroySCVM(vm_id)
+    else: 
+        print("There was a problem powering down the SCVM. Please make sure it's powered off and run this script again.")
+    
+def destroySCVM(vm_id):
+    print("Destroying the SCVM")
+    command = 'vim-cmd vmsvc/destroy ' + str(vm_id)
+    result = executeFunctionWithReadlines(command)
+    if len(result) == 0:
+        print("SCVM has been destroyed. Proceeding to clean up the networking")
+        deletePortGroups()
+    elif(len(result) > 0 and 'vim.fault.NotFound' in result[0]):
+        print("The vm doesnt exist.. Proceeding to clean up the networking")
+        deletePortGroups()
+
+portgroup_list = []
+def deletePortGroups():
+    command = "esxcli network vswitch standard portgroup list | sed -n '2!p' | sed -n '1!p'"
+    result = executeFunctionWithReadlines(command)    
+    listCounter = 0
+    for line in result:
+        line = line.split("  ")
+        listCounter = listCounter + 1        
+        counter = 0
+        vswitch_port_group_list = {}
+        for index in line:            
+            if (index is not ''):
+                counter = counter + 1
+                if counter == 1:
+                    vswitch_port_group_list["name"] = index.strip()
+                if counter == 2:
+                    vswitch_port_group_list["Virtual Switch"] = index.strip()
+                if counter == 3:
+                    vswitch_port_group_list["Active Clients"] = index.strip()
+                if counter == 4: 
+                    vswitch_port_group_list["VLAN ID"] = index.strip()
+        portgroup_list.insert(listCounter, vswitch_port_group_list)
+    for index in portgroup_list:
+        if(index["name"] == "Management Network"):
+            print("Skipping deletion of " + index["name"])
+        else:
+            command = 'esxcli network vswitch standard portgroup remove -v '+index['Virtual Switch']+' -p "'+index['name']+'"'
+            output = executeFunctionWithReadlines(command)
+            print(output)
+    
+    command = "esxcli network vswitch standard portgroup list | sed -n '2!p' | sed -n '1!p' | wc -l" 
+    result = executeFunctionWithRead(command)
+    result = str(result).strip()    
+    print("Length of port group list: " + str(result))
+    if int(result) == 2 or int(result) == 1:
+        print("All necessary port groups have been deleted.. Moving on to delete the VMK's")
+        deleteVMKs()        
+    else:
+        print("There was a problem with deleting the port groups from the vswitches. Please delete the port groups from the vswitches and try again.")
+
+    
+def deleteVMKs():
+    print("Deleting VMKernel Adapters")
+    
+    command = 'esxcli network ip interface list | grep "Name: vmk*"'
+    result = executeFunctionWithReadlines(command)
+    for line in result:
+        line = line.split(" ")
+        for index in line:
+            if index != '':
+                if "vmk" in str(index):
+                    index = str(index).strip()
+                    print("index: " + index[3])
+                    if int(index[3]) >= 1:
+                        command = "esxcli network ip interface remove -i " + index
+                        output = executeFunctionWithReadlines(command)
+                        verification_command = 'esxcli network ip interface list | grep "Name: vmk*" | wc -l'
+                        result = executeFunctionWithRead(verification_command)  
+                        result = str(result).strip()
+                        if int(result) == 1:                    
+                            print("All necessary VMK's have been deleted. Proceeding with deleting vswitches...")
+                            deleteVswitches(portgroup_list)
+                        else:
+                            print("There was a problem with deleting the necessary VMK's. Please delete all the VMK's except vmk0 and run this script again.")
+                    else:
+                        if(int(executeFunctionWithRead("esxcli network ip interface list | grep -i 'Name: vmk*' | wc -l")) == 1):
+                            print("Only vmk0 exists.. proceeding to delete vswitches")
+                            deleteVswitches(portgroup_list)
+
+def deleteVswitches(portgroup_list):
+    print("Deleting the vswitches")
+    
+    command = 'esxcli network vswitch standard list | grep "Name: "'
+    result = executeFunctionWithReadlines(command)
+    vswitches = []
+    # Getting the vswitches to delete
+    for line in result:
+        line = line.split(" ")        
+        for index in line:
+            if index is not '' and 'Name:' not in index:
+                vswitches.append(str(index).strip())        
+
+    for vswitch in vswitches:
+        if "vswitch-hx-inband-mgmt" in vswitch:
+            print("Not deleting: " + str(vswitch) + '. Moving on..')
+        else:
+            command = 'esxcli network vswitch standard remove -v "'+vswitch+'"'
+            output = executeFunctionWithRead(command)
+
+    # Verify that vswitches have been deleted
+    verification_command = 'esxcli network vswitch standard list | grep -i Name | wc -l'
+    result = executeFunctionWithRead(verification_command)
+    result = str(result).strip()
+    if int(result) == 1:
+        print("All vswitches have been deleted. Proceed to delete orphaned SCVM")
+        deleteOrphanedSCVM()
+    else:
+        print("There was a problem with deleting the vswitches. Please delete all of the vswitches EXCEPT vswitch-hx-inband-mgmt and run this script again. ")
+
+def deleteOrphanedSCVM():
+    print("Please delete the orphaned SCVM from VCenter... Press 1 when this has been complete")
+    deletedOrphanVm = input()
+    if int(deletedOrphanVm) == 1:
+        deleteDataStores()
+    else:
+        print("Please remove the orphaned VM and run this script again")
+
+listOfDataStores = []
+setOfDataStores = {}
+def deleteDataStores():
+    print("Starting datastore deletion")
+    command = "grep -i nas /etc/vmware/esx.conf"
+    result = executeFunctionWithReadlines(command)
+    # output = os.popen(command)
+    # result = output.readlines()
+    for line in result:
+        if "STFSNasPlugin" in line:
+            print("Not deleting " + line)
+        else:
+            line = line.split("/")
+            # print(line[2])
+            listOfDataStores.append(str(line[2]))
+    setOfDataStores = set(listOfDataStores)
+    
+    if len(setOfDataStores) >= 1:
+        for ds in setOfDataStores:
+            command = "esxcfg-nas -d " + ds
+            print("Deleting datastore: " + ds + ". This may take a moment")
+            print(command)
+            output = executeFunctionWithRead(command)
+            print(output)
+    verification_command = "grep -i nas /etc/vmware/esx.conf | wc -l"
+    numberOfDatastores = int(executeFunctionWithRead(verification_command))
+    print("The length of the datastores: " + str(numberOfDatastores))
+    if numberOfDatastores == 2:
+        print("All necessary datastores have been deleted. Proceeding to SSD cleaning.")        
+        uninstallESXIVibs()
+        # cleanInternalSSD()
+    else:
+        print("Something went wrong while deleting the datastores. Please delete the datastores and run this script again.")
+
+filesystem_list = []
+set_of_commands = []
+def cleanInternalSSD():
+    counter = 0
+    command = 'esxcli storage filesystem list'
+    result = executeFunctionWithReadlines(command)
+    # output = os.popen(command)
+    # result = output.readlines()
+    uuid = ''
+    for line in result:
+        # print(line)
+        if('SpringpathDS' in line):
+            line = line.split(" ")
+            for index in line:
+                if index is not '':
+                    counter = counter+1
+                    filesystem_list.insert(counter, index)
+            uuid = filesystem_list[2]
+            print(uuid)
+    command2 = 'esxcli system coredump file remove --force'
+    executeFunctionWithRead(command2)
+    command3 = 'esxcfg-dumppart -d'
+    executeFunctionWithRead(command3)
+    command4 = 'rm -rf /scratch'
+    executeFunctionWithRead(command4)
+    command5 = 'ps | grep vmsyslogd'
+    result = executeFunctionWithReadlines(command5)
+    # output = os.popen(command5)
+    # result = output.readlines()
+    zibby = []
+    zibCount = 0
+    for line in result:
+        line = line.split(" ")
+        for index in line:
+            if index is not '':
+                zibCount = zibCount + 1
+                zibby.insert(zibCount, index)
+    process = zibby[1]
+    command6 = 'kill -9 ' + str(process)
+    executeFunctionWithRead(command6)
+    command7 = 'esxcli storage filsystem unmount -p /vmfs/volumes/' + str(uuid)
+    executeFunctionWithRead(command7)
+
+    print("Do we need to clean the SSD's? Note: SSD's need to be cleaned IF: \n 1. Node is being added back into a cluster running HyperFlex that is not 3.0+ \n 1. The whole cluster is being redeployed \n Input 1 for yes or 0 for no")
+    cleanSSDs = input()
+    if(cleanSSDs == "1"):
+        # Get the hardware to confirm how we will be cleaning the SSD's
+        serverModel = getServerModel()
+        print("The server model: " + serverModel)
+        if 'M5' in serverModel or 'm5' in serverModel:
+            print("This is an M5.. cleaning")
+            cleanM2SSDM5()
+        elif 'M4' in serverModel or 'm4' in serverModel:
+            print("This is an M4.. cleaning")
+            cleanBackSSDM4()
+        else:
+            print("This node does not have an M.2 SSD or back SSD that needs to be cleaned. Moving on..")
+    else:
+        print("Please reboot the ESXi host and redeploy HX.")
+
+
+def getServerModel():
+    command = 'esxcli hardware platform get | grep -i "product name"'
+    # output = os.popen(command)
+    # result = output.read()
+    result = executeFunctionWithRead(command)
+    if str(result).startswith('Product Name:'):
+        print(result)
+    device_model = ((str(result)).strip()[13:str(result).find('.')]).strip()    
+    return device_model
+
+partitionList = []
+def cleanM2SSDM5():
+    # result = getM4BackSSDPartitionList()
+    print("Skipping SSD cleaning on this M5")
+
+    # for listItem in result:
+        # print(listItem)
+        # if ((int(listItem[1]) == 0) or (int(listItem[1]) == 3)):
+        #     print("Skipping partition " + listItem[1])
+        # else:
+        #     command = 'partedUtil delete /vmfs/devices/disks/' + str(listItem[0]) + ' ' + str(listItem[1])
+        #     print("The partedutil Command: ")
+        #     print(command)
+            # executeFunctionWithReadlines(command)
+    # uninstallESXIVibs()
+    
+    # print(result)
+    
+    # output = os.popen(command)
+    # result = output.read()
+    # if str(result).startswith('Product Name:'):
+    #     print(result)
+    # device_model = (str(result)).strip()[13:str(result).find('.')]
+    # print(device_model.strip())
+
+def getM4BackSSDPartitionList():
+    m4PartitionList = []
+    print("in getM4BackSSDPartitionList")
+    command = "esxcli storage core device partition list | sed -n '2!p' | sed -n '1!p'"
+    # output = os.popen(command)
+    # result = output.readlines()
+    result = executeFunctionWithReadlines(command)
+    partitionIndex = 0
+    temp = []
+    for line in result:       
+        # print(line)        
+        if 't10' in line:            
+            partitionIndex = partitionIndex + 1
+            line = line.split(" ")
+            temp = []
+            for index in line:
+                if index is not '':
+                    temp.append(index)            
+            m4PartitionList.insert(partitionIndex, temp)
+    return m4PartitionList
+        # print(line)
+    
+
+def cleanBackSSDM4():
+    print("In cleanBackSSDM4")
+    m4PartitionList = getM4BackSSDPartitionList()  
+    time.sleep(5)
+    for partition in m4PartitionList:                
+        if int(partition[1]) == 1:
+            command = 'partedUtil delete /vmfs/devices/disks/' + partition[0] + ' ' + partition[1]
+            executeFunctionWithReadlines(command)
+    
+    # Verify that the partition has been deleted, and format SSD to a GPT disk
+    partition1Exists = 0
+    verifyM4PartitionList = getM4BackSSDPartitionList()
+
+    if len(m4PartitionList) >= 2 and len(m4PartitionList) == 1 and int(m4PartitionList[1]) == 0:
+        print("Back SSD on the M4 has successfully been cleaned. \n Ready to proceed to turning disk into gpt. ")
+        formatSSDToGPT()        
+    elif len(getM4BackSSDPartitionList()) == 1:
+        print("Back SSD on the M4 has successfully been cleaned. \n Ready to proceed to turning disk into gpt. ")
+        formatSSDToGPT()
+
+def formatSSDToGPT():
+    print("In the format SSD to GPT function")
+    m4PartitionList = getM4BackSSDPartitionList()    
+    command = "partedUtil mklabel /vmfs/devices/disks/" + str(m4PartitionList[0][0]) + " gpt"
+    output = executeFunctionWithReadlines(command)
+    print(output)
+    verification_command = 'partedUtil getpbl /vmfs/devices/disks/' + m4PartitionList[0][0]
+    output = executeFunctionWithReadlines(verification_command)
+    if len(output) == 0:
+        print("Complete. Please reboot the server and redeploy HX. ")        
+        # cleanInternalSSD()
+        # uninstallESXIVibs()
+    # print(verification_command)
+
+def uninstallESXIVibs():
+    vibList = []
+    print("In the uninstallESXIVibs function")
+    command = 'esxcli software vib list | grep -i spring'
+    output = executeFunctionWithReadlines(command)
+    temp = []
+    tempCount = 0
+    for line in output:
+        temp = []
+        tempCount = tempCount + 1
+        line = line.split(" ")
+        for index in line:    
+            if(index is not ''):
+                temp.append(index)            
+        vibList.insert(tempCount, temp)    
+    for vib in vibList:
+        command = 'esxcli software vib remove -n ' + vib[0]
+        commandOutput = executeFunctionWithReadlines(command)
+        # print(commandOutput)
+        for response in commandOutput:
+            if 'Message' in response and 'successfully' in response:                
+                print("Success in removing Vib.. moving on..")
+                # print(response)
+            elif('Reboot Required' in response and 'true' in response):
+                print("ESXi needs to reboot to remove " + vib[0])
+                # print(response)
+            elif "No VIB matching VIB search specification '" + str(vib) in str(response):
+                print("Proceed..")
+    cleanInternalSSD()
+
+def executeFunctionWithReadlines(command):
+    print("Executing: " + command)
+    output = os.popen(command)
+    result = output.readlines()
+    output.close()
+    return result
+
+def executeFunctionWithRead(command):
+    print("Executing: " + command)
+    output = os.popen(command)
+    result = output.read()
+    output.close()
+    return result
+    
+def checkSEDStatus():
+    print('Is this a SED cluster? Input 1 for yes and 0 for no')
+    sed_cluster = input()
+    if(sed_cluster == '1'):
+        print("Have the disks been unlocked? Input 1 for yes and 0 for no")
+        unlocked = input()
+        if(unlocked == "1"):
+            sshIntoSCVM()
+            print("Proceeding.. ")
+        else:
+            print("Please unlock the drives and run this script again.")
+    else:
+        print(" This is not a SED clsuter.. Proceeding")
+        sshIntoSCVM()
+    
+    
+
+def main():
+    checkSEDStatus()
 
 if __name__ == "__main__":
     main()
