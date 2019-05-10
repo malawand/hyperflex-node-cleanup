@@ -24,11 +24,6 @@ __license__ = "Cisco Sample Code License, Version 1.1"
 # The script should be used if:
 #   1. ESXi was re-imaged on a 240 M5 or M4 HCS HX Node
 #   2. Something or someone accidentally changed the ESXi host network settings and it needs to be restored.
-#
-# How to use:
-#   1. Put the script on the affected host via FTP/SCP
-#   2. Run the command, 'py esxi-restore.py'
-#   3. Input all of the IP addresses that is requested for that host
 ################################################################################################
 #   This script is used to clean up an existing HyperFlex node running ESXi.                   #
 #   This script is NOT used to cleanup the cluster itself, but just the node in the cluster    #
