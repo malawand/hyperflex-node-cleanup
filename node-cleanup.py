@@ -16,7 +16,7 @@ or implied.
 
 __author__ = "Mazen Lawand"
 __email__ = "malawand@cisco.com"
-__version__ = "0.1.0"
+__version__ = "1.1.0"
 __copyright__ = "Copyright (c) 2019 Cisco and/or its affiliates."
 __license__ = "Cisco Sample Code License, Version 1.1"
 
@@ -96,12 +96,13 @@ def sshIntoSCVM():
         if power_state == "on":
             print("Has the SCVM been relinquished? Input 1 for yes and 0 for no")
             scvm_relinquished = input()
-            if scvm_relinquished == "1":            
+            if (scvm_relinquished == "1") or (scvm_relinquished == 1):            
                 powerOffSCVM(vm_id)
-            elif scvm_relinquished == "0":
-                print("Please relinquish the SCVM from the cluster before proceeding.")
-                print("SSH into the storage controller VM as root. ssh root@" + ip)
+            elif (scvm_relinquished == "0") or (scvm_relinquished == 0):
+                print("Please relinquish the SCVM from the cluster before proceeding.")                
+                # print("SSH into the storage controller VM as root. ssh root@" + ip)
                 print("Issue the command: python /usr/share/springpath/storfs-misc/relinquish_node.py ")
+                exit()
         elif power_state == "off":
             print("SCVM is powered off")
             destroySCVM(vm_id)
@@ -321,18 +322,28 @@ def cleanInternalSSD():
     command7 = 'esxcli storage filsystem unmount -p /vmfs/volumes/' + str(uuid)
     executeFunctionWithRead(command7)
 
-    print("Do we need to clean the SSD's? Note: SSD's need to be cleaned IF: \n 1. Node is being added back into a cluster running HyperFlex that is not 3.0+ \n 1. The whole cluster is being redeployed \n Input 1 for yes or 0 for no")
+    print("Do we need to clean the SSD's? Note: SSD's need to be cleaned IF: \n   - The whole cluster is being redeployed \n Input 1 for yes or 0 for no")
     cleanSSDs = input()
-    if(cleanSSDs == "1"):
+    if((cleanSSDs == "1") or (cleanSSDs == 1)):
         # Get the hardware to confirm how we will be cleaning the SSD's
         serverModel = getServerModel()
         print("The server model: " + serverModel)
         if 'M5' in serverModel or 'm5' in serverModel:
-            print("This is an M5.. cleaning")
+            print("This script will no longer clena the SSD's")
+            print("** IMPORTANT ** DO NOT SELECT CLEANUP DISK PARTITIONS IF THE NODE IS GOING BACK INTO AN EXISTING CLUSTER. ")
+            print("** IMPORTANT ** ONLY SELECT 'CLEANUP DISK PARTITIONS' IF THE WHOLE CLUSTER IS BEING REDEPLOYED")
+            print("Please reboot the ESXi host and redeploy HX")
+            exit()
+            # print("This is an M5.. cleaning")
             cleanM2SSDM5()
         elif 'M4' in serverModel or 'm4' in serverModel:
-            print("This is an M4.. cleaning")
-            cleanBackSSDM4()
+            # print("This is an M4.. cleaning")
+            print("This script will no longer clena the SSD's")
+            print("** IMPORTANT ** DO NOT SELECT CLEANUP DISK PARTITIONS IF THE NODE IS GOING BACK INTO AN EXISTING CLUSTER. ")
+            print("** IMPORTANT ** ONLY SELECT 'CLEANUP DISK PARTITIONS' IF THE WHOLE CLUSTER IS BEING REDEPLOYED")
+            print("Please reboot the ESXi host and redeploy HX")
+            exit()
+            # cleanBackSSDM4()
         else:
             print("This node does not have an M.2 SSD or back SSD that needs to be cleaned. Moving on..")
     else:
@@ -462,14 +473,14 @@ def uninstallESXIVibs():
     cleanInternalSSD()
 
 def executeFunctionWithReadlines(command):
-    print("Executing: " + command)
+    print("     >> Executing: " + command)
     output = os.popen(command)
     result = output.readlines()
     output.close()
     return result
 
 def executeFunctionWithRead(command):
-    print("Executing: " + command)
+    print("     >>Executing: " + command)
     output = os.popen(command)
     result = output.read()
     output.close()
@@ -478,10 +489,10 @@ def executeFunctionWithRead(command):
 def checkSEDStatus():
     print('Is this a SED cluster? Input 1 for yes and 0 for no')
     sed_cluster = input()
-    if(sed_cluster == '1'):
+    if((sed_cluster == 1) or (sed_cluster == '1')):
         print("Have the disks been unlocked? Input 1 for yes and 0 for no")
         unlocked = input()
-        if(unlocked == "1"):
+        if((unlocked == 1) or (unlocked == '1')):
             sshIntoSCVM()
             print("Proceeding.. ")
         else:
